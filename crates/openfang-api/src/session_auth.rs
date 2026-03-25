@@ -55,29 +55,48 @@ pub fn verify_session_token(token: &str, secret: &str) -> Option<String> {
     }
 }
 
-/// Hash a password with SHA256 for config storage.
+/// Hash a password with Argon2id (salted, memory-hard).
 pub fn hash_password(password: &str) -> String {
-    use sha2::Digest;
-    hex::encode(Sha256::digest(password.as_bytes()))
+    use argon2::password_hash::{rand_core::OsRng, SaltString};
+    use argon2::{Argon2, PasswordHasher};
+    let salt = SaltString::generate(&mut OsRng);
+    Argon2::default()
+        .hash_password(password.as_bytes(), &salt)
+        .expect("Argon2 hash")
+        .to_string()
 }
 
 /// Compare two secrets in constant time using fixed-width digests.
 ///
 /// Both inputs are hashed to SHA-256 (fixed 32 bytes) before comparison,
 /// eliminating length oracles that leak information about the expected secret.
-/// TODO(B10): Implement fixed-width digest comparison.
-pub fn fixed_width_eq(_a: &str, _b: &str) -> bool {
-    false
+pub fn fixed_width_eq(a: &str, b: &str) -> bool {
+    use sha2::Digest;
+    use subtle::ConstantTimeEq;
+    let hash_a = Sha256::digest(a.as_bytes());
+    let hash_b = Sha256::digest(b.as_bytes());
+    hash_a.ct_eq(&hash_b).into()
 }
 
-/// Verify a password against a stored SHA256 hash (constant-time).
+/// Verify a password against a stored hash.
+///
+/// Supports both Argon2id (preferred) and legacy SHA-256 hex hashes
+/// for backward compatibility during migration.
 pub fn verify_password(password: &str, stored_hash: &str) -> bool {
-    let computed = hash_password(password);
-    use subtle::ConstantTimeEq;
-    if computed.len() != stored_hash.len() {
-        return false;
+    if stored_hash.starts_with("$argon2") {
+        use argon2::{Argon2, PasswordHash, PasswordVerifier};
+        let Ok(parsed) = PasswordHash::new(stored_hash) else {
+            return false;
+        };
+        Argon2::default()
+            .verify_password(password.as_bytes(), &parsed)
+            .is_ok()
+    } else {
+        // Legacy SHA-256 fallback
+        use sha2::Digest;
+        let computed = hex::encode(Sha256::digest(password.as_bytes()));
+        fixed_width_eq(&computed, stored_hash)
     }
-    computed.as_bytes().ct_eq(stored_hash.as_bytes()).into()
 }
 
 #[cfg(test)]

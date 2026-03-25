@@ -153,14 +153,9 @@ pub async fn auth(
             .and_then(|v| v.to_str().ok())
     });
 
-    // SECURITY: Use constant-time comparison to prevent timing attacks.
-    let header_auth = api_token.map(|token| {
-        use subtle::ConstantTimeEq;
-        if token.len() != api_key.len() {
-            return false;
-        }
-        token.as_bytes().ct_eq(api_key.as_bytes()).into()
-    });
+    // SECURITY (B10): Use fixed-width digest comparison to prevent length oracles.
+    let header_auth =
+        api_token.map(|token| crate::session_auth::fixed_width_eq(token, api_key));
 
     // Also check ?token= query parameter (for EventSource/SSE clients that
     // cannot set custom headers, same approach as WebSocket auth).
@@ -169,14 +164,9 @@ pub async fn auth(
         .query()
         .and_then(|q| q.split('&').find_map(|pair| pair.strip_prefix("token=")));
 
-    // SECURITY: Use constant-time comparison to prevent timing attacks.
-    let query_auth = query_token.map(|token| {
-        use subtle::ConstantTimeEq;
-        if token.len() != api_key.len() {
-            return false;
-        }
-        token.as_bytes().ct_eq(api_key.as_bytes()).into()
-    });
+    // SECURITY (B10): Use fixed-width digest comparison to prevent length oracles.
+    let query_auth =
+        query_token.map(|token| crate::session_auth::fixed_width_eq(token, api_key));
 
     // Accept if either auth method matches
     if header_auth == Some(true) || query_auth == Some(true) {

@@ -10563,7 +10563,7 @@ pub async fn list_commands(State(state): State<Arc<AppState>>) -> impl IntoRespo
     Json(serde_json::json!({"commands": commands}))
 }
 
-/// SECURITY: Validate webhook bearer token using constant-time comparison.
+/// SECURITY (B10): Validate webhook bearer token using fixed-width digest comparison.
 fn validate_webhook_token(headers: &axum::http::HeaderMap, token_env: &str) -> bool {
     let expected = match std::env::var(token_env) {
         Ok(t) if t.len() >= 32 => t,
@@ -10578,11 +10578,7 @@ fn validate_webhook_token(headers: &axum::http::HeaderMap, token_env: &str) -> b
         None => return false,
     };
 
-    use subtle::ConstantTimeEq;
-    if provided.len() != expected.len() {
-        return false;
-    }
-    provided.as_bytes().ct_eq(expected.as_bytes()).into()
+    crate::session_auth::fixed_width_eq(provided, &expected)
 }
 
 // ══════════════════════════════════════════════════════════════════════
@@ -11232,7 +11228,6 @@ pub async fn auth_login(
         .body(Body::from(
             serde_json::json!({
                 "status": "ok",
-                "token": token,
                 "username": username,
             })
             .to_string(),

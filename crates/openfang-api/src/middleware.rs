@@ -23,6 +23,10 @@ pub fn redact_uri(uri: &str) -> String {
             .map(|pair| {
                 if pair.starts_with("token=") {
                     "token=[REDACTED]"
+                } else if pair.starts_with("url=") {
+                    "url=[REDACTED]"
+                } else if pair.starts_with("session_id=") {
+                    "session_id=[REDACTED]"
                 } else {
                     pair
                 }

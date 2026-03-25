@@ -26,7 +26,25 @@ struct TestServer {
     base_url: String,
     state: Arc<AppState>,
     session_secret: String,
+    api_key: String,
     _tmp: tempfile::TempDir,
+}
+
+impl TestServer {
+    /// Create an HTTP client that sends the API key as a Bearer token.
+    fn client(&self) -> reqwest::Client {
+        let mut headers = reqwest::header::HeaderMap::new();
+        if !self.api_key.is_empty() {
+            headers.insert(
+                "authorization",
+                format!("Bearer {}", self.api_key).parse().unwrap(),
+            );
+        }
+        reqwest::Client::builder()
+            .default_headers(headers)
+            .build()
+            .unwrap()
+    }
 }
 
 impl Drop for TestServer {
@@ -35,16 +53,123 @@ impl Drop for TestServer {
     }
 }
 
-/// Start a test server using ollama as default provider (no API key needed).
-/// This lets the kernel boot without any real LLM credentials.
+/// Start a test server with a default API key for auth.
+/// Most tests should use this since fail-closed auth rejects unauthenticated requests.
 /// Tests that need actual LLM calls should use `start_test_server_with_llm()`.
 async fn start_test_server() -> TestServer {
+    start_test_server_with_auth("test-api-key").await
+}
+
+/// Start a test server with NO credentials configured.
+/// Only use this to test fail-closed behavior (B1/B2).
+async fn start_test_server_no_auth() -> TestServer {
     start_test_server_with_provider("ollama", "test-model", "OLLAMA_API_KEY").await
 }
 
 /// Start a test server with Groq as the LLM provider (requires GROQ_API_KEY).
 async fn start_test_server_with_llm() -> TestServer {
-    start_test_server_with_provider("groq", "llama-3.3-70b-versatile", "GROQ_API_KEY").await
+    let tmp = tempfile::tempdir().expect("Failed to create temp dir");
+    let api_key = "test-api-key".to_string();
+    let config = KernelConfig {
+        home_dir: tmp.path().to_path_buf(),
+        data_dir: tmp.path().join("data"),
+        api_key: api_key.clone(),
+        default_model: DefaultModelConfig {
+            provider: "groq".to_string(),
+            model: "llama-3.3-70b-versatile".to_string(),
+            api_key_env: "GROQ_API_KEY".to_string(),
+            base_url: None,
+        },
+        ..KernelConfig::default()
+    };
+
+    let kernel = OpenFangKernel::boot_with_config(config).expect("Kernel should boot");
+    let kernel = Arc::new(kernel);
+    kernel.set_self_handle();
+
+    let state = Arc::new(AppState {
+        kernel,
+        started_at: Instant::now(),
+        peer_registry: None,
+        bridge_manager: tokio::sync::Mutex::new(None),
+        channels_config: tokio::sync::RwLock::new(Default::default()),
+        shutdown_notify: Arc::new(tokio::sync::Notify::new()),
+        clawhub_cache: dashmap::DashMap::new(),
+        provider_probe_cache: openfang_runtime::provider_health::ProbeCache::new(),
+    });
+
+    let auth_state = middleware::AuthState {
+        api_key: api_key.clone(),
+        auth_enabled: false,
+        session_secret: api_key.clone(),
+    };
+
+    let app = Router::new()
+        .route("/api/health", axum::routing::get(routes::health))
+        .route("/api/status", axum::routing::get(routes::status))
+        .route(
+            "/api/agents",
+            axum::routing::get(routes::list_agents).post(routes::spawn_agent),
+        )
+        .route(
+            "/api/agents/{id}/message",
+            axum::routing::post(routes::send_message),
+        )
+        .route(
+            "/api/agents/{id}/session",
+            axum::routing::get(routes::get_agent_session),
+        )
+        .route("/api/agents/{id}/ws", axum::routing::get(ws::agent_ws))
+        .route(
+            "/api/agents/{id}",
+            axum::routing::delete(routes::kill_agent),
+        )
+        .route(
+            "/api/triggers",
+            axum::routing::get(routes::list_triggers).post(routes::create_trigger),
+        )
+        .route(
+            "/api/triggers/{id}",
+            axum::routing::delete(routes::delete_trigger),
+        )
+        .route(
+            "/api/workflows",
+            axum::routing::get(routes::list_workflows).post(routes::create_workflow),
+        )
+        .route(
+            "/api/workflows/{id}/run",
+            axum::routing::post(routes::run_workflow),
+        )
+        .route(
+            "/api/workflows/{id}/runs",
+            axum::routing::get(routes::list_workflow_runs),
+        )
+        .route("/api/shutdown", axum::routing::post(routes::shutdown))
+        .layer(axum::middleware::from_fn_with_state(
+            auth_state,
+            middleware::auth,
+        ))
+        .layer(axum::middleware::from_fn(middleware::request_logging))
+        .layer(TraceLayer::new_for_http())
+        .layer(CorsLayer::permissive())
+        .with_state(state.clone());
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("Failed to bind test server");
+    let addr = listener.local_addr().unwrap();
+
+    tokio::spawn(async move {
+        axum::serve(listener, app.into_make_service_with_connect_info::<std::net::SocketAddr>()).await.unwrap();
+    });
+
+    TestServer {
+        base_url: format!("http://{}", addr),
+        state,
+        session_secret: api_key.clone(),
+        api_key,
+        _tmp: tmp,
+    }
 }
 
 async fn start_test_server_with_provider(
@@ -122,6 +247,14 @@ async fn start_test_server_with_provider(
             axum::routing::get(routes::list_workflow_runs),
         )
         .route("/api/shutdown", axum::routing::post(routes::shutdown))
+        .layer(axum::middleware::from_fn_with_state(
+            middleware::AuthState {
+                api_key: state.kernel.config.api_key.trim().to_string(),
+                auth_enabled: state.kernel.config.auth.enabled,
+                session_secret: String::new(),
+            },
+            middleware::auth,
+        ))
         .layer(axum::middleware::from_fn(middleware::request_logging))
         .layer(TraceLayer::new_for_http())
         .layer(CorsLayer::permissive())
@@ -140,6 +273,7 @@ async fn start_test_server_with_provider(
         base_url: format!("http://{}", addr),
         state,
         session_secret: String::new(),
+        api_key: String::new(),
         _tmp: tmp,
     }
 }
@@ -189,7 +323,7 @@ memory_write = ["self.*"]
 #[tokio::test]
 async fn test_health_endpoint() {
     let server = start_test_server().await;
-    let client = reqwest::Client::new();
+    let client = server.client();
 
     let resp = client
         .get(format!("{}/api/health", server.base_url))
@@ -214,7 +348,7 @@ async fn test_health_endpoint() {
 #[tokio::test]
 async fn test_status_endpoint() {
     let server = start_test_server().await;
-    let client = reqwest::Client::new();
+    let client = server.client();
 
     let resp = client
         .get(format!("{}/api/status", server.base_url))
@@ -234,7 +368,7 @@ async fn test_status_endpoint() {
 #[tokio::test]
 async fn test_spawn_list_kill_agent() {
     let server = start_test_server().await;
-    let client = reqwest::Client::new();
+    let client = server.client();
 
     // --- Spawn ---
     let resp = client
@@ -288,7 +422,7 @@ async fn test_spawn_list_kill_agent() {
 #[tokio::test]
 async fn test_agent_session_empty() {
     let server = start_test_server().await;
-    let client = reqwest::Client::new();
+    let client = server.client();
 
     // Spawn agent
     let resp = client
@@ -323,7 +457,7 @@ async fn test_send_message_with_llm() {
     }
 
     let server = start_test_server_with_llm().await;
-    let client = reqwest::Client::new();
+    let client = server.client();
 
     // Spawn
     let resp = client
@@ -371,7 +505,7 @@ async fn test_send_message_with_llm() {
 #[tokio::test]
 async fn test_workflow_crud() {
     let server = start_test_server().await;
-    let client = reqwest::Client::new();
+    let client = server.client();
 
     // Spawn agent for workflow
     let resp = client
@@ -423,7 +557,7 @@ async fn test_workflow_crud() {
 #[tokio::test]
 async fn test_trigger_crud() {
     let server = start_test_server().await;
-    let client = reqwest::Client::new();
+    let client = server.client();
 
     // Spawn agent for trigger
     let resp = client
@@ -500,7 +634,7 @@ async fn test_trigger_crud() {
 #[tokio::test]
 async fn test_invalid_agent_id_returns_400() {
     let server = start_test_server().await;
-    let client = reqwest::Client::new();
+    let client = server.client();
 
     // Send message to invalid ID
     let resp = client
@@ -533,7 +667,7 @@ async fn test_invalid_agent_id_returns_400() {
 #[tokio::test]
 async fn test_kill_nonexistent_agent_returns_404() {
     let server = start_test_server().await;
-    let client = reqwest::Client::new();
+    let client = server.client();
 
     let fake_id = uuid::Uuid::new_v4();
     let resp = client
@@ -547,7 +681,7 @@ async fn test_kill_nonexistent_agent_returns_404() {
 #[tokio::test]
 async fn test_spawn_invalid_manifest_returns_400() {
     let server = start_test_server().await;
-    let client = reqwest::Client::new();
+    let client = server.client();
 
     let resp = client
         .post(format!("{}/api/agents", server.base_url))
@@ -563,7 +697,7 @@ async fn test_spawn_invalid_manifest_returns_400() {
 #[tokio::test]
 async fn test_request_id_header_is_uuid() {
     let server = start_test_server().await;
-    let client = reqwest::Client::new();
+    let client = server.client();
 
     let resp = client
         .get(format!("{}/api/health", server.base_url))
@@ -586,7 +720,7 @@ async fn test_request_id_header_is_uuid() {
 #[tokio::test]
 async fn test_multiple_agents_lifecycle() {
     let server = start_test_server().await;
-    let client = reqwest::Client::new();
+    let client = server.client();
 
     // Spawn 3 agents
     let mut ids = Vec::new();
@@ -786,7 +920,8 @@ async fn start_test_server_with_auth(api_key: &str) -> TestServer {
     TestServer {
         base_url: format!("http://{}", addr),
         state,
-        session_secret: api_key,
+        session_secret: api_key.clone(),
+        api_key,
         _tmp: tmp,
     }
 }
@@ -920,6 +1055,7 @@ async fn start_test_server_with_full_auth(api_key: &str, password: &str) -> Test
         base_url: format!("http://{}", addr),
         state,
         session_secret,
+        api_key: api_key.to_string(),
         _tmp: tmp,
     }
 }
@@ -997,7 +1133,7 @@ async fn test_b1_empty_api_key_rejects_protected_endpoints() {
     // B1: When no api_key is configured and dashboard auth is disabled,
     // the server must REJECT requests to protected endpoints (fail-closed).
     // Previously this returned 200 (auth was silently disabled).
-    let server = start_test_server().await;
+    let server = start_test_server_no_auth().await;
     let client = reqwest::Client::new();
 
     let resp = client
@@ -1016,7 +1152,7 @@ async fn test_b1_empty_api_key_rejects_protected_endpoints() {
 async fn test_b1_health_still_public_without_credentials() {
     // /api/health must remain accessible even with no credentials configured,
     // so monitoring tools still work.
-    let server = start_test_server().await;
+    let server = start_test_server_no_auth().await;
     let client = reqwest::Client::new();
 
     let resp = client
@@ -1033,7 +1169,7 @@ async fn test_b1_health_still_public_without_credentials() {
 async fn test_b2_websocket_rejects_when_no_api_key() {
     // B2: WebSocket upgrades must be rejected when no api_key is set.
     // Previously ws.rs skipped auth entirely when api_key was empty.
-    let server = start_test_server().await;
+    let server = start_test_server_no_auth().await;
     let client = reqwest::Client::new();
 
     // Attempt a WebSocket upgrade without credentials. We use a plain HTTP
@@ -1155,7 +1291,7 @@ async fn test_b3_ws_duplicate_auth_rejects_session_cookie_when_api_key_set() {
         server.base_url.strip_prefix("http://").unwrap()
     );
 
-    let mut request = tokio_tungstenite::tungstenite::http::Request::builder()
+    let request = tokio_tungstenite::tungstenite::http::Request::builder()
         .uri(&ws_url)
         .header("cookie", format!("openfang_session={session_token}"))
         .header("connection", "Upgrade")

@@ -14,6 +14,30 @@ use tracing::info;
 /// Request ID header name (standard).
 pub const REQUEST_ID_HEADER: &str = "x-request-id";
 
+/// Redact sensitive query parameters from a URI before logging.
+pub fn redact_uri(uri: &str) -> String {
+    if let Some(qmark) = uri.find('?') {
+        let (path, query) = uri.split_at(qmark + 1);
+        let redacted: Vec<&str> = query
+            .split('&')
+            .map(|pair| {
+                if pair.starts_with("token=") {
+                    "token=[REDACTED]"
+                } else if pair.starts_with("url=") {
+                    "url=[REDACTED]"
+                } else if pair.starts_with("session_id=") {
+                    "session_id=[REDACTED]"
+                } else {
+                    pair
+                }
+            })
+            .collect();
+        format!("{}{}", path, redacted.join("&"))
+    } else {
+        uri.to_string()
+    }
+}
+
 /// Middleware: inject a unique request ID and log the request/response.
 pub async fn request_logging(request: Request<Body>, next: Next) -> Response<Body> {
     let request_id = uuid::Uuid::new_v4().to_string();
@@ -80,50 +104,21 @@ pub async fn auth(
         }
     }
 
-    // Public endpoints that don't require auth (dashboard needs these).
-    // SECURITY: /api/agents is GET-only (listing). POST (spawn) requires auth.
-    // SECURITY: Public endpoints are GET-only unless explicitly noted.
-    // POST/PUT/DELETE to any endpoint ALWAYS requires auth to prevent
-    // unauthenticated writes (cron job creation, skill install, etc.).
+    // SECURITY (B3): Minimal public endpoints — only what's truly needed without auth.
+    // Static assets and health checks are public. Everything else requires auth.
+    // Previously, a massive allowlist exposed agents, config, budget, sessions,
+    // skills, channels, and more to unauthenticated reads.
     let is_get = method == axum::http::Method::GET;
     let is_public = path == "/"
         || path == "/logo.png"
         || path == "/favicon.ico"
+        || path == "/manifest.json"
+        || path == "/sw.js"
+        || path.starts_with("/static/")
         || (path == "/.well-known/agent.json" && is_get)
-        || (path.starts_with("/a2a/") && is_get)
         || path == "/api/health"
-        || path == "/api/health/detail"
-        || path == "/api/status"
         || path == "/api/version"
-        || (path == "/api/agents" && is_get)
-        || (path == "/api/profiles" && is_get)
-        || (path == "/api/config" && is_get)
-        || (path == "/api/config/schema" && is_get)
-        || (path.starts_with("/api/uploads/") && is_get)
-        // Dashboard read endpoints — allow unauthenticated so the SPA can
-        // render before the user enters their API key.
-        || (path == "/api/models" && is_get)
-        || (path == "/api/models/aliases" && is_get)
-        || (path == "/api/providers" && is_get)
-        || (path == "/api/budget" && is_get)
-        || (path == "/api/budget/agents" && is_get)
-        || (path.starts_with("/api/budget/agents/") && is_get)
-        || (path == "/api/network/status" && is_get)
-        || (path == "/api/a2a/agents" && is_get)
-        || (path == "/api/approvals" && is_get)
-        || (path.starts_with("/api/approvals/") && is_get)
-        || (path == "/api/channels" && is_get)
-        || (path == "/api/hands" && is_get)
-        || (path == "/api/hands/active" && is_get)
-        || (path.starts_with("/api/hands/") && is_get)
-        || (path == "/api/skills" && is_get)
-        || (path == "/api/sessions" && is_get)
-        || (path == "/api/integrations" && is_get)
-        || (path == "/api/integrations/available" && is_get)
-        || (path == "/api/integrations/health" && is_get)
-        || (path == "/api/workflows" && is_get)
-        || path == "/api/logs/stream"  // SSE stream, read-only
-        || (path.starts_with("/api/cron/") && is_get)
+        || path.starts_with("/hooks/") // Webhook endpoints have their own token auth
         || path.starts_with("/api/providers/github-copilot/oauth/")
         || path == "/api/auth/login"
         || path == "/api/auth/logout"
@@ -133,12 +128,18 @@ pub async fn auth(
         return next.run(request).await;
     }
 
-    // If no API key configured (empty, whitespace-only, or missing), skip auth
-    // entirely. Users who don't set api_key accept that all endpoints are open.
-    // To secure the dashboard, set a non-empty api_key in config.toml.
+    // SECURITY (B1): Fail-closed — if no credential is configured, reject.
+    // Previously empty api_key + disabled dashboard auth silently bypassed
+    // all authentication. Now non-public endpoints always require auth.
     let api_key_trimmed = auth_state.api_key.trim().to_string();
     if api_key_trimmed.is_empty() && !auth_state.auth_enabled {
-        return next.run(request).await;
+        return Response::builder()
+            .status(StatusCode::UNAUTHORIZED)
+            .header("www-authenticate", "Bearer")
+            .body(Body::from(
+                serde_json::json!({"error": "No authentication configured. Set api_key or enable dashboard auth in config.toml"}).to_string(),
+            ))
+            .unwrap_or_default();
     }
     let api_key = api_key_trimmed.as_str();
 
@@ -156,14 +157,9 @@ pub async fn auth(
             .and_then(|v| v.to_str().ok())
     });
 
-    // SECURITY: Use constant-time comparison to prevent timing attacks.
-    let header_auth = api_token.map(|token| {
-        use subtle::ConstantTimeEq;
-        if token.len() != api_key.len() {
-            return false;
-        }
-        token.as_bytes().ct_eq(api_key.as_bytes()).into()
-    });
+    // SECURITY (B10): Use fixed-width digest comparison to prevent length oracles.
+    let header_auth =
+        api_token.map(|token| crate::session_auth::fixed_width_eq(token, api_key));
 
     // Also check ?token= query parameter (for EventSource/SSE clients that
     // cannot set custom headers, same approach as WebSocket auth).
@@ -172,14 +168,9 @@ pub async fn auth(
         .query()
         .and_then(|q| q.split('&').find_map(|pair| pair.strip_prefix("token=")));
 
-    // SECURITY: Use constant-time comparison to prevent timing attacks.
-    let query_auth = query_token.map(|token| {
-        use subtle::ConstantTimeEq;
-        if token.len() != api_key.len() {
-            return false;
-        }
-        token.as_bytes().ct_eq(api_key.as_bytes()).into()
-    });
+    // SECURITY (B10): Use fixed-width digest comparison to prevent length oracles.
+    let query_auth =
+        query_token.map(|token| crate::session_auth::fixed_width_eq(token, api_key));
 
     // Accept if either auth method matches
     if header_auth == Some(true) || query_auth == Some(true) {
@@ -229,6 +220,9 @@ fn extract_session_cookie(request: &Request<Body>) -> Option<String> {
         })
 }
 
+/// Content Security Policy header value.
+pub const CSP_HEADER: &str = "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com https://fonts.gstatic.com; img-src 'self' data: blob:; connect-src 'self' ws://localhost:* ws://127.0.0.1:* wss://localhost:* wss://127.0.0.1:*; font-src 'self' https://fonts.gstatic.com; media-src 'self' blob:; frame-src 'self' blob:; object-src 'none'; base-uri 'self'; form-action 'self'";
+
 /// Security headers middleware — applied to ALL API responses.
 pub async fn security_headers(request: Request<Body>, next: Next) -> Response<Body> {
     let mut response = next.run(request).await;
@@ -239,9 +233,7 @@ pub async fn security_headers(request: Request<Body>, next: Next) -> Response<Bo
     // All JS/CSS is bundled inline — only external resource is Google Fonts.
     headers.insert(
         "content-security-policy",
-        "default-src 'self'; script-src 'self' 'unsafe-inline' 'unsafe-eval'; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com https://fonts.gstatic.com; img-src 'self' data: blob:; connect-src 'self' ws://localhost:* ws://127.0.0.1:* wss://localhost:* wss://127.0.0.1:*; font-src 'self' https://fonts.gstatic.com; media-src 'self' blob:; frame-src 'self' blob:; object-src 'none'; base-uri 'self'; form-action 'self'"
-            .parse()
-            .unwrap(),
+        CSP_HEADER.parse().unwrap(),
     );
     headers.insert(
         "referrer-policy",
@@ -265,5 +257,88 @@ mod tests {
     #[test]
     fn test_request_id_header_constant() {
         assert_eq!(REQUEST_ID_HEADER, "x-request-id");
+    }
+
+    #[test]
+    fn test_b6_redact_uri_strips_token_param() {
+        // B6: URIs logged by tracing must NOT contain secret query parameters.
+        // redact_uri() should strip sensitive params like ?token= from the URI
+        // before it reaches any log output.
+        assert_eq!(
+            redact_uri("/api/logs/stream?token=s3cret"),
+            "/api/logs/stream?token=[REDACTED]"
+        );
+    }
+
+    #[test]
+    fn test_b6_redact_uri_preserves_other_params() {
+        assert_eq!(
+            redact_uri("/api/agents?page=1&token=s3cret&limit=10"),
+            "/api/agents?page=1&token=[REDACTED]&limit=10"
+        );
+    }
+
+    #[test]
+    fn test_b6_redact_uri_no_query_unchanged() {
+        assert_eq!(redact_uri("/api/health"), "/api/health");
+    }
+
+    #[test]
+    fn test_b6_redact_uri_strips_url_param() {
+        // B6: The `url` parameter on A2A task status endpoints can contain
+        // access tokens and API keys embedded in the URL.
+        assert_eq!(
+            redact_uri("/api/a2a/tasks/123/status?url=https://example.com/agent?api_key=secret"),
+            "/api/a2a/tasks/123/status?url=[REDACTED]"
+        );
+    }
+
+    #[test]
+    fn test_b6_redact_uri_strips_session_id_param() {
+        // B6: The `session_id` parameter on WhatsApp QR status can aid session hijack.
+        assert_eq!(
+            redact_uri("/api/channels/whatsapp/qr/status?session_id=abc123"),
+            "/api/channels/whatsapp/qr/status?session_id=[REDACTED]"
+        );
+    }
+
+    #[test]
+    fn test_b6_redact_uri_strips_multiple_sensitive_params() {
+        // B6: Multiple sensitive params in one URI should all be redacted.
+        assert_eq!(
+            redact_uri("/api/test?token=s3cret&url=https://evil.com&session_id=abc&page=1"),
+            "/api/test?token=[REDACTED]&url=[REDACTED]&session_id=[REDACTED]&page=1"
+        );
+    }
+
+    #[test]
+    fn test_b7_csp_no_unsafe_eval() {
+        // B7: The Content-Security-Policy must NOT include 'unsafe-eval' in script-src.
+        // unsafe-eval allows eval(), new Function(), etc. — making XSS exploitation
+        // trivial. Alpine.js v3 works without eval via CSP-compatible mode.
+        let csp = CSP_HEADER;
+        assert!(
+            !csp.contains("unsafe-eval"),
+            "B7: CSP must not contain 'unsafe-eval' — it enables trivial XSS exploitation"
+        );
+    }
+
+    #[test]
+    fn test_b7_js_no_api_key_in_localstorage() {
+        // B7: JavaScript must NOT store the API key in localStorage.
+        // Any XSS vulnerability can read localStorage, making it equivalent to
+        // credential theft. Auth should use HttpOnly session cookies instead.
+        let app_js = include_str!("../static/js/app.js");
+        let api_js = include_str!("../static/js/api.js");
+
+        let app_stores_key = app_js.contains("localStorage.setItem('openfang-api-key'");
+        let api_stores_key = api_js.contains("localStorage.setItem('openfang-api-key'");
+        let app_reads_key = app_js.contains("localStorage.getItem('openfang-api-key'");
+        let api_reads_key = api_js.contains("localStorage.getItem('openfang-api-key'");
+
+        assert!(
+            !app_stores_key && !api_stores_key && !app_reads_key && !api_reads_key,
+            "B7: JavaScript must not store/read API keys in localStorage — use HttpOnly cookies instead"
+        );
     }
 }

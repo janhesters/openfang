@@ -24,6 +24,8 @@ pub fn operation_cost(method: &str, path: &str) -> NonZeroU32 {
         ("GET", "/api/usage") => NonZeroU32::new(3).unwrap(),
         ("GET", p) if p.starts_with("/api/audit") => NonZeroU32::new(5).unwrap(),
         ("GET", p) if p.starts_with("/api/marketplace") => NonZeroU32::new(10).unwrap(),
+        ("POST", "/api/auth/login") => NonZeroU32::new(100).unwrap(),
+        ("GET", "/api/auth/check") => NonZeroU32::new(10).unwrap(),
         ("POST", "/api/agents") => NonZeroU32::new(50).unwrap(),
         ("POST", p) if p.contains("/message") => NonZeroU32::new(30).unwrap(),
         ("POST", p) if p.contains("/run") => NonZeroU32::new(100).unwrap(),
@@ -95,5 +97,28 @@ mod tests {
         assert_eq!(operation_cost("GET", "/api/audit/recent").get(), 5);
         assert_eq!(operation_cost("POST", "/api/skills/install").get(), 50);
         assert_eq!(operation_cost("POST", "/api/migrate").get(), 100);
+    }
+
+    #[test]
+    fn test_b13_auth_login_has_high_cost() {
+        // B13: Auth endpoints must have a high cost to prevent brute-force attacks.
+        // With 500 tokens/min budget, a cost of 100 limits to 5 attempts/min.
+        // Currently auth login falls through to the default cost of 5, allowing
+        // 100 attempts/min — way too generous for password guessing.
+        let cost = operation_cost("POST", "/api/auth/login").get();
+        assert!(
+            cost >= 100,
+            "B13: auth/login cost must be >= 100 to limit brute-force, got {cost}"
+        );
+    }
+
+    #[test]
+    fn test_b13_auth_check_has_moderate_cost() {
+        // B13: auth/check is less sensitive but still shouldn't be free
+        let cost = operation_cost("GET", "/api/auth/check").get();
+        assert!(
+            cost >= 10,
+            "B13: auth/check cost should be >= 10, got {cost}"
+        );
     }
 }

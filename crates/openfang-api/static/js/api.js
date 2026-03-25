@@ -167,7 +167,6 @@ var OpenFangAPI = (function() {
             var store = Alpine.store('app');
             if (store && !store.showAuthPrompt) {
               _authToken = '';
-              localStorage.removeItem('openfang-api-key');
               store.showAuthPrompt = true;
             }
           } catch(e2) { /* ignore Alpine errors */ }

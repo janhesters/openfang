@@ -216,6 +216,9 @@ fn extract_session_cookie(request: &Request<Body>) -> Option<String> {
         })
 }
 
+/// Content Security Policy header value.
+pub const CSP_HEADER: &str = "default-src 'self'; script-src 'self' 'unsafe-inline' 'unsafe-eval'; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com https://fonts.gstatic.com; img-src 'self' data: blob:; connect-src 'self' ws://localhost:* ws://127.0.0.1:* wss://localhost:* wss://127.0.0.1:*; font-src 'self' https://fonts.gstatic.com; media-src 'self' blob:; frame-src 'self' blob:; object-src 'none'; base-uri 'self'; form-action 'self'";
+
 /// Security headers middleware — applied to ALL API responses.
 pub async fn security_headers(request: Request<Body>, next: Next) -> Response<Body> {
     let mut response = next.run(request).await;
@@ -226,9 +229,7 @@ pub async fn security_headers(request: Request<Body>, next: Next) -> Response<Bo
     // All JS/CSS is bundled inline — only external resource is Google Fonts.
     headers.insert(
         "content-security-policy",
-        "default-src 'self'; script-src 'self' 'unsafe-inline' 'unsafe-eval'; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com https://fonts.gstatic.com; img-src 'self' data: blob:; connect-src 'self' ws://localhost:* ws://127.0.0.1:* wss://localhost:* wss://127.0.0.1:*; font-src 'self' https://fonts.gstatic.com; media-src 'self' blob:; frame-src 'self' blob:; object-src 'none'; base-uri 'self'; form-action 'self'"
-            .parse()
-            .unwrap(),
+        CSP_HEADER.parse().unwrap(),
     );
     headers.insert(
         "referrer-policy",
@@ -276,5 +277,36 @@ mod tests {
     #[test]
     fn test_b6_redact_uri_no_query_unchanged() {
         assert_eq!(redact_uri("/api/health"), "/api/health");
+    }
+
+    #[test]
+    fn test_b7_csp_no_unsafe_eval() {
+        // B7: The Content-Security-Policy must NOT include 'unsafe-eval' in script-src.
+        // unsafe-eval allows eval(), new Function(), etc. — making XSS exploitation
+        // trivial. Alpine.js v3 works without eval via CSP-compatible mode.
+        let csp = CSP_HEADER;
+        assert!(
+            !csp.contains("unsafe-eval"),
+            "B7: CSP must not contain 'unsafe-eval' — it enables trivial XSS exploitation"
+        );
+    }
+
+    #[test]
+    fn test_b7_js_no_api_key_in_localstorage() {
+        // B7: JavaScript must NOT store the API key in localStorage.
+        // Any XSS vulnerability can read localStorage, making it equivalent to
+        // credential theft. Auth should use HttpOnly session cookies instead.
+        let app_js = include_str!("../static/js/app.js");
+        let api_js = include_str!("../static/js/api.js");
+
+        let app_stores_key = app_js.contains("localStorage.setItem('openfang-api-key'");
+        let api_stores_key = api_js.contains("localStorage.setItem('openfang-api-key'");
+        let app_reads_key = app_js.contains("localStorage.getItem('openfang-api-key'");
+        let api_reads_key = api_js.contains("localStorage.getItem('openfang-api-key'");
+
+        assert!(
+            !app_stores_key && !api_stores_key && !app_reads_key && !api_reads_key,
+            "B7: JavaScript must not store/read API keys in localStorage — use HttpOnly cookies instead"
+        );
     }
 }

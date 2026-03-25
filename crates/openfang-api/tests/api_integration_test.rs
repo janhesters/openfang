@@ -1033,6 +1033,9 @@ async fn start_test_server_with_full_auth(api_key: &str, password: &str) -> Test
             axum::routing::get(routes::list_workflow_runs),
         )
         .route("/api/shutdown", axum::routing::post(routes::shutdown))
+        .route("/api/auth/login", axum::routing::post(routes::auth_login))
+        .route("/api/auth/logout", axum::routing::post(routes::auth_logout))
+        .route("/api/auth/check", axum::routing::get(routes::auth_check))
         .layer(axum::middleware::from_fn_with_state(
             auth_state,
             middleware::auth,
@@ -1527,4 +1530,30 @@ async fn test_b3_ws_duplicate_auth_rejects_session_cookie_when_api_key_set() {
             // WebSocket connected — auth passed. That's the desired outcome after the fix.
         }
     }
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// B8: Session material duplicated in JSON responses
+// ═══════════════════════════════════════════════════════════════════
+
+#[tokio::test]
+async fn test_b8_login_response_does_not_leak_token() {
+    // B8: The login response must NOT include the session token in the JSON body.
+    // Returning the token in JSON duplicates it outside HttpOnly cookie protection,
+    // making it readable by JavaScript (XSS can steal it from the response body
+    // even though the cookie is HttpOnly).
+    let server = start_test_server_with_dashboard_auth().await;
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(format!("{}/api/auth/login", server.base_url))
+        .json(&serde_json::json!({"username": "admin", "password": "test-password"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert!(
+        body.get("token").is_none(),
+        "B8: login response must NOT include token in JSON body — use HttpOnly cookie only, got: {body}"
+    );
 }

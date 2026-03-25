@@ -61,6 +61,15 @@ pub fn hash_password(password: &str) -> String {
     hex::encode(Sha256::digest(password.as_bytes()))
 }
 
+/// Compare two secrets in constant time using fixed-width digests.
+///
+/// Both inputs are hashed to SHA-256 (fixed 32 bytes) before comparison,
+/// eliminating length oracles that leak information about the expected secret.
+/// TODO(B10): Implement fixed-width digest comparison.
+pub fn fixed_width_eq(_a: &str, _b: &str) -> bool {
+    false
+}
+
 /// Verify a password against a stored SHA256 hash (constant-time).
 pub fn verify_password(password: &str, stored_hash: &str) -> bool {
     let computed = hash_password(password);
@@ -105,5 +114,42 @@ mod tests {
     #[test]
     fn test_password_hash_length_mismatch() {
         assert!(!verify_password("x", "short"));
+    }
+
+    #[test]
+    fn test_b4_password_hash_is_salted() {
+        // B4: Unsalted SHA-256 means the same password always produces the same hash.
+        // A proper password hash (Argon2, bcrypt, etc.) uses a random salt,
+        // so hashing the same password twice must produce different outputs.
+        let hash1 = hash_password("my-password");
+        let hash2 = hash_password("my-password");
+        assert_ne!(
+            hash1, hash2,
+            "B4: password hash must be salted — same input must produce different hashes"
+        );
+    }
+
+    #[test]
+    fn test_b4_password_hash_not_plain_sha256() {
+        // B4: SHA-256 produces a 64-char hex string. A proper password hash
+        // includes algorithm metadata (e.g. "$argon2id$...") and is longer.
+        let hash = hash_password("test");
+        assert!(
+            hash.len() > 64,
+            "B4: password hash should not be plain SHA-256 (64 hex chars), got length {}",
+            hash.len()
+        );
+    }
+
+    #[test]
+    fn test_b10_fixed_width_eq_correct() {
+        // B10: Comparing secrets must use fixed-width digests to eliminate length oracles.
+        // A `fixed_width_eq` function should hash both inputs to SHA-256 (fixed 32 bytes)
+        // before constant-time comparison, so input length never leaks.
+        assert!(fixed_width_eq("secret", "secret"));
+        assert!(!fixed_width_eq("secret", "wrong"));
+        assert!(!fixed_width_eq("secret", "secre")); // different length, no short-circuit
+        assert!(!fixed_width_eq("secret", "secrets")); // different length, no short-circuit
+        assert!(!fixed_width_eq("", "x"));
     }
 }

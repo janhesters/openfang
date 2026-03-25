@@ -25,6 +25,7 @@ use tower_http::trace::TraceLayer;
 struct TestServer {
     base_url: String,
     state: Arc<AppState>,
+    session_secret: String,
     _tmp: tempfile::TempDir,
 }
 
@@ -132,12 +133,13 @@ async fn start_test_server_with_provider(
     let addr = listener.local_addr().unwrap();
 
     tokio::spawn(async move {
-        axum::serve(listener, app).await.unwrap();
+        axum::serve(listener, app.into_make_service_with_connect_info::<std::net::SocketAddr>()).await.unwrap();
     });
 
     TestServer {
         base_url: format!("http://{}", addr),
         state,
+        session_secret: String::new(),
         _tmp: tmp,
     }
 }
@@ -778,12 +780,146 @@ async fn start_test_server_with_auth(api_key: &str) -> TestServer {
     let addr = listener.local_addr().unwrap();
 
     tokio::spawn(async move {
-        axum::serve(listener, app).await.unwrap();
+        axum::serve(listener, app.into_make_service_with_connect_info::<std::net::SocketAddr>()).await.unwrap();
     });
 
     TestServer {
         base_url: format!("http://{}", addr),
         state,
+        session_secret: api_key,
+        _tmp: tmp,
+    }
+}
+
+/// Start a test server with dashboard auth (username/password) enabled but no API key.
+/// This tests the session cookie authentication path.
+async fn start_test_server_with_dashboard_auth() -> TestServer {
+    start_test_server_with_full_auth("", "test-password").await
+}
+
+/// Start a test server with BOTH api_key and dashboard auth enabled.
+/// This exposes the inconsistency where ws.rs has its own auth that ignores session cookies.
+async fn start_test_server_with_both_auth(api_key: &str) -> TestServer {
+    start_test_server_with_full_auth(api_key, "test-password").await
+}
+
+/// Shared helper: start a test server with optional api_key and dashboard auth.
+async fn start_test_server_with_full_auth(api_key: &str, password: &str) -> TestServer {
+    use openfang_types::config::AuthConfig;
+
+    let tmp = tempfile::tempdir().expect("Failed to create temp dir");
+    let password_hash =
+        openfang_api::session_auth::hash_password(password);
+
+    let config = KernelConfig {
+        home_dir: tmp.path().to_path_buf(),
+        data_dir: tmp.path().join("data"),
+        api_key: api_key.to_string(),
+        auth: AuthConfig {
+            enabled: true,
+            username: "admin".to_string(),
+            password_hash: password_hash.clone(),
+            session_ttl_hours: 1,
+        },
+        default_model: DefaultModelConfig {
+            provider: "ollama".to_string(),
+            model: "test-model".to_string(),
+            api_key_env: "OLLAMA_API_KEY".to_string(),
+            base_url: None,
+        },
+        ..KernelConfig::default()
+    };
+
+    let kernel = OpenFangKernel::boot_with_config(config).expect("Kernel should boot");
+    let kernel = Arc::new(kernel);
+    kernel.set_self_handle();
+
+    let state = Arc::new(AppState {
+        kernel,
+        started_at: Instant::now(),
+        peer_registry: None,
+        bridge_manager: tokio::sync::Mutex::new(None),
+        channels_config: tokio::sync::RwLock::new(Default::default()),
+        shutdown_notify: Arc::new(tokio::sync::Notify::new()),
+        clawhub_cache: dashmap::DashMap::new(),
+        provider_probe_cache: openfang_runtime::provider_health::ProbeCache::new(),
+    });
+
+    let api_key_trimmed = state.kernel.config.api_key.trim().to_string();
+    let session_secret = if !api_key_trimmed.is_empty() {
+        api_key_trimmed.clone()
+    } else {
+        password_hash.clone()
+    };
+    let auth_state = middleware::AuthState {
+        api_key: api_key_trimmed,
+        auth_enabled: true,
+        session_secret: session_secret.clone(),
+    };
+
+    let app = Router::new()
+        .route("/api/health", axum::routing::get(routes::health))
+        .route("/api/status", axum::routing::get(routes::status))
+        .route(
+            "/api/agents",
+            axum::routing::get(routes::list_agents).post(routes::spawn_agent),
+        )
+        .route(
+            "/api/agents/{id}/message",
+            axum::routing::post(routes::send_message),
+        )
+        .route(
+            "/api/agents/{id}/session",
+            axum::routing::get(routes::get_agent_session),
+        )
+        .route("/api/agents/{id}/ws", axum::routing::get(ws::agent_ws))
+        .route(
+            "/api/agents/{id}",
+            axum::routing::delete(routes::kill_agent),
+        )
+        .route(
+            "/api/triggers",
+            axum::routing::get(routes::list_triggers).post(routes::create_trigger),
+        )
+        .route(
+            "/api/triggers/{id}",
+            axum::routing::delete(routes::delete_trigger),
+        )
+        .route(
+            "/api/workflows",
+            axum::routing::get(routes::list_workflows).post(routes::create_workflow),
+        )
+        .route(
+            "/api/workflows/{id}/run",
+            axum::routing::post(routes::run_workflow),
+        )
+        .route(
+            "/api/workflows/{id}/runs",
+            axum::routing::get(routes::list_workflow_runs),
+        )
+        .route("/api/shutdown", axum::routing::post(routes::shutdown))
+        .layer(axum::middleware::from_fn_with_state(
+            auth_state,
+            middleware::auth,
+        ))
+        .layer(axum::middleware::from_fn(middleware::request_logging))
+        .layer(TraceLayer::new_for_http())
+        .layer(CorsLayer::permissive())
+        .with_state(state.clone());
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("Failed to bind test server");
+    let addr = listener.local_addr().unwrap();
+
+    tokio::spawn(async move {
+        axum::serve(listener, app.into_make_service_with_connect_info::<std::net::SocketAddr>()).await.unwrap();
+    });
+
+    TestServer {
+        base_url: format!("http://{}", addr),
+        state,
+        session_secret,
         _tmp: tmp,
     }
 }
@@ -854,17 +990,207 @@ async fn test_auth_accepts_correct_token() {
     assert_eq!(body["status"], "running");
 }
 
+// ---- B1: Fail-closed — empty api_key must NOT disable auth ----
+
 #[tokio::test]
-async fn test_auth_disabled_when_no_key() {
-    // Empty API key = auth disabled
+async fn test_b1_empty_api_key_rejects_protected_endpoints() {
+    // B1: When no api_key is configured and dashboard auth is disabled,
+    // the server must REJECT requests to protected endpoints (fail-closed).
+    // Previously this returned 200 (auth was silently disabled).
     let server = start_test_server().await;
     let client = reqwest::Client::new();
 
-    // Protected endpoint accessible without auth when no key is configured
     let resp = client
         .get(format!("{}/api/status", server.base_url))
         .send()
         .await
         .unwrap();
+    assert_eq!(
+        resp.status(),
+        401,
+        "B1: Empty api_key must not disable auth — expected 401, got 200"
+    );
+}
+
+#[tokio::test]
+async fn test_b1_health_still_public_without_credentials() {
+    // /api/health must remain accessible even with no credentials configured,
+    // so monitoring tools still work.
+    let server = start_test_server().await;
+    let client = reqwest::Client::new();
+
+    let resp = client
+        .get(format!("{}/api/health", server.base_url))
+        .send()
+        .await
+        .unwrap();
     assert_eq!(resp.status(), 200);
+}
+
+// ---- B2: WebSocket auth bypass when api_key is empty ----
+
+#[tokio::test]
+async fn test_b2_websocket_rejects_when_no_api_key() {
+    // B2: WebSocket upgrades must be rejected when no api_key is set.
+    // Previously ws.rs skipped auth entirely when api_key was empty.
+    let server = start_test_server().await;
+    let client = reqwest::Client::new();
+
+    // Attempt a WebSocket upgrade without credentials. We use a plain HTTP
+    // request (not a real WS handshake) to a known agent WS path — the auth
+    // check happens before the upgrade, so we'll get 401 back.
+    let resp = client
+        .get(format!("{}/api/agents/fake-id/ws", server.base_url))
+        .send()
+        .await
+        .unwrap();
+    // Should be 401 (auth required), not 400 (upgrade failed) or 200
+    assert_eq!(
+        resp.status(),
+        401,
+        "B2: WebSocket must reject unauthenticated upgrades even when api_key is empty"
+    );
+}
+
+#[tokio::test]
+async fn test_b2_websocket_rejects_wrong_token() {
+    // Even with api_key set, wrong token must be rejected for WS
+    let server = start_test_server_with_auth("secret-key-123").await;
+    let client = reqwest::Client::new();
+
+    let resp = client
+        .get(format!("{}/api/agents/fake-id/ws", server.base_url))
+        .header("authorization", "Bearer wrong-key")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 401);
+}
+
+// ---- B3: Consistent auth across HTTP, SSE, WebSocket ----
+
+#[tokio::test]
+async fn test_b3_websocket_accepts_session_cookie() {
+    // B3: WebSocket auth should accept session cookies (dashboard login),
+    // not just Bearer tokens. Currently ws.rs has its own auth that only
+    // checks Bearer/query tokens, ignoring session cookies entirely.
+    let server = start_test_server_with_dashboard_auth().await;
+
+    // Create a valid session token
+    let session_token = openfang_api::session_auth::create_session_token(
+        "admin",
+        &server.session_secret,
+        1, // 1 hour
+    );
+
+    let client = reqwest::Client::new();
+    let resp = client
+        .get(format!("{}/api/agents/fake-id/ws", server.base_url))
+        .header("cookie", format!("openfang_session={session_token}"))
+        .send()
+        .await
+        .unwrap();
+
+    // With a valid session cookie, we should NOT get 401.
+    // We might get 400 (not a real WS upgrade) or another status, but not 401.
+    assert_ne!(
+        resp.status(),
+        401,
+        "B3: WebSocket should accept valid session cookies, not just Bearer tokens"
+    );
+}
+
+#[tokio::test]
+async fn test_b3_all_transports_reject_without_auth() {
+    // B3: HTTP, SSE, and WebSocket must all reject unauthenticated requests
+    // to protected endpoints when credentials are configured.
+    let server = start_test_server_with_auth("secret-key-123").await;
+    let client = reqwest::Client::new();
+
+    // HTTP GET (protected endpoint)
+    let http_resp = client
+        .get(format!("{}/api/agents", server.base_url))
+        .send()
+        .await
+        .unwrap();
+
+    // WebSocket upgrade attempt
+    let ws_resp = client
+        .get(format!("{}/api/agents/fake-id/ws", server.base_url))
+        .send()
+        .await
+        .unwrap();
+
+    // Both must return 401
+    assert_eq!(http_resp.status(), 401, "B3: HTTP must reject without auth");
+    assert_eq!(
+        ws_resp.status(),
+        401,
+        "B3: WebSocket must reject without auth"
+    );
+}
+
+#[tokio::test]
+async fn test_b3_ws_duplicate_auth_rejects_session_cookie_when_api_key_set() {
+    // B3: When BOTH api_key and dashboard auth are enabled, a user who logged
+    // in via the dashboard (has a valid session cookie but no Bearer token)
+    // should be able to open a WebSocket. Currently this FAILS because ws.rs
+    // has its own auth check that only looks at Bearer/query tokens, ignoring
+    // the session cookie that the middleware already validated.
+    //
+    // This test will FAIL until we remove the duplicate auth from ws.rs.
+    let server = start_test_server_with_both_auth("secret-key-123").await;
+
+    // Create a valid session token (as if the user logged in via dashboard)
+    let session_token = openfang_api::session_auth::create_session_token(
+        "admin",
+        &server.session_secret,
+        1,
+    );
+
+    // Use tokio-tungstenite for a real WebSocket handshake.
+    // We add the session cookie as a custom header in the upgrade request.
+    let ws_url = format!(
+        "ws://{}/api/agents/fake-id/ws",
+        server.base_url.strip_prefix("http://").unwrap()
+    );
+
+    let mut request = tokio_tungstenite::tungstenite::http::Request::builder()
+        .uri(&ws_url)
+        .header("cookie", format!("openfang_session={session_token}"))
+        .header("connection", "Upgrade")
+        .header("upgrade", "websocket")
+        .header("sec-websocket-version", "13")
+        .header("sec-websocket-key", tokio_tungstenite::tungstenite::handshake::client::generate_key())
+        .header("host", server.base_url.strip_prefix("http://").unwrap())
+        .body(())
+        .unwrap();
+
+    let result = tokio_tungstenite::connect_async(request).await;
+
+    // The middleware should accept the session cookie and let the request through.
+    // But ws.rs has its OWN auth that only checks Bearer/query tokens.
+    // With api_key set and no Bearer token, ws.rs rejects with 401 even though
+    // the middleware already authenticated via session cookie.
+    //
+    // This test FAILS until we remove the duplicate auth from ws.rs.
+    match &result {
+        Err(tokio_tungstenite::tungstenite::Error::Http(resp)) => {
+            assert_ne!(
+                resp.status(),
+                401,
+                "B3: ws.rs duplicate auth rejects valid session cookie — \
+                 remove duplicate auth from ws.rs so all transports use the middleware"
+            );
+        }
+        Err(_other) => {
+            panic!(
+                "B3: Expected HTTP 401 from ws.rs duplicate auth, but got a non-HTTP error: {_other}. \
+                 This test must produce a clear 401 to prove the duplicate auth is the problem."
+            );
+        }
+        Ok(_) => {
+            // WebSocket connected — auth passed. That's the desired outcome after the fix.
+        }
+    }
 }

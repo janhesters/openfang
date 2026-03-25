@@ -43,3 +43,4 @@ reqwest = { workspace = true }
 tokio-test = { workspace = true }
 tempfile = { workspace = true }
 uuid = { workspace = true }
+tokio-tungstenite = { workspace = true }

@@ -10299,16 +10299,13 @@ pub async fn webhook_agent(
             }
         },
         None => {
-            // No agent specified — use the first available agent
-            match state.kernel.registry.list().first() {
-                Some(entry) => entry.id,
-                None => {
-                    return (
-                        StatusCode::NOT_FOUND,
-                        Json(serde_json::json!({"error": "No agents available"})),
-                    );
-                }
-            }
+            // SECURITY (B12): Reject webhooks that don't specify a target agent.
+            // Defaulting to an arbitrary agent routes untrusted external input
+            // to an agent the webhook owner may not have intended.
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": "Webhook must specify a target agent by name or ID"})),
+            );
         }
     };
 

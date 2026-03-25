@@ -15,9 +15,23 @@ use tracing::info;
 pub const REQUEST_ID_HEADER: &str = "x-request-id";
 
 /// Redact sensitive query parameters from a URI before logging.
-/// TODO(B6): Implement redaction of ?token= and other secret params.
 pub fn redact_uri(uri: &str) -> String {
-    uri.to_string()
+    if let Some(qmark) = uri.find('?') {
+        let (path, query) = uri.split_at(qmark + 1);
+        let redacted: Vec<&str> = query
+            .split('&')
+            .map(|pair| {
+                if pair.starts_with("token=") {
+                    "token=[REDACTED]"
+                } else {
+                    pair
+                }
+            })
+            .collect();
+        format!("{}{}", path, redacted.join("&"))
+    } else {
+        uri.to_string()
+    }
 }
 
 /// Middleware: inject a unique request ID and log the request/response.

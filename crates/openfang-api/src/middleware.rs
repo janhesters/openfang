@@ -280,6 +280,34 @@ mod tests {
     }
 
     #[test]
+    fn test_b6_redact_uri_strips_url_param() {
+        // B6: The `url` parameter on A2A task status endpoints can contain
+        // access tokens and API keys embedded in the URL.
+        assert_eq!(
+            redact_uri("/api/a2a/tasks/123/status?url=https://example.com/agent?api_key=secret"),
+            "/api/a2a/tasks/123/status?url=[REDACTED]"
+        );
+    }
+
+    #[test]
+    fn test_b6_redact_uri_strips_session_id_param() {
+        // B6: The `session_id` parameter on WhatsApp QR status can aid session hijack.
+        assert_eq!(
+            redact_uri("/api/channels/whatsapp/qr/status?session_id=abc123"),
+            "/api/channels/whatsapp/qr/status?session_id=[REDACTED]"
+        );
+    }
+
+    #[test]
+    fn test_b6_redact_uri_strips_multiple_sensitive_params() {
+        // B6: Multiple sensitive params in one URI should all be redacted.
+        assert_eq!(
+            redact_uri("/api/test?token=s3cret&url=https://evil.com&session_id=abc&page=1"),
+            "/api/test?token=[REDACTED]&url=[REDACTED]&session_id=[REDACTED]&page=1"
+        );
+    }
+
+    #[test]
     fn test_b7_csp_no_unsafe_eval() {
         // B7: The Content-Security-Policy must NOT include 'unsafe-eval' in script-src.
         // unsafe-eval allows eval(), new Function(), etc. — making XSS exploitation

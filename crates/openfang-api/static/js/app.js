@@ -121,10 +121,6 @@ function toolIcon(toolName) {
 
 // Alpine.js global store
 document.addEventListener('alpine:init', function() {
-  // Restore saved API key on load
-  var savedKey = localStorage.getItem('openfang-api-key');
-  if (savedKey) OpenFangAPI.setAuthToken(savedKey);
-
   Alpine.store('app', {
     agents: [],
     connected: false,
@@ -235,11 +231,7 @@ document.addEventListener('alpine:init', function() {
         this.showAuthPrompt = false;
       } catch(e) {
         if (e.message && (e.message.indexOf('Not authorized') >= 0 || e.message.indexOf('401') >= 0 || e.message.indexOf('Missing Authorization') >= 0 || e.message.indexOf('Unauthorized') >= 0)) {
-          var saved = localStorage.getItem('openfang-api-key');
-          if (saved) {
-            OpenFangAPI.setAuthToken('');
-            localStorage.removeItem('openfang-api-key');
-          }
+          OpenFangAPI.setAuthToken('');
           this.showAuthPrompt = true;
         }
       }
@@ -248,7 +240,6 @@ document.addEventListener('alpine:init', function() {
     submitApiKey(key) {
       if (!key || !key.trim()) return;
       OpenFangAPI.setAuthToken(key.trim());
-      localStorage.setItem('openfang-api-key', key.trim());
       this.showAuthPrompt = false;
       this.refreshAgents();
     },
@@ -278,7 +269,6 @@ document.addEventListener('alpine:init', function() {
 
     clearApiKey() {
       OpenFangAPI.setAuthToken('');
-      localStorage.removeItem('openfang-api-key');
     }
   });
 });

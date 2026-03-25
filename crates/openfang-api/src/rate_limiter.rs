@@ -96,4 +96,27 @@ mod tests {
         assert_eq!(operation_cost("POST", "/api/skills/install").get(), 50);
         assert_eq!(operation_cost("POST", "/api/migrate").get(), 100);
     }
+
+    #[test]
+    fn test_b13_auth_login_has_high_cost() {
+        // B13: Auth endpoints must have a high cost to prevent brute-force attacks.
+        // With 500 tokens/min budget, a cost of 100 limits to 5 attempts/min.
+        // Currently auth login falls through to the default cost of 5, allowing
+        // 100 attempts/min — way too generous for password guessing.
+        let cost = operation_cost("POST", "/api/auth/login").get();
+        assert!(
+            cost >= 100,
+            "B13: auth/login cost must be >= 100 to limit brute-force, got {cost}"
+        );
+    }
+
+    #[test]
+    fn test_b13_auth_check_has_moderate_cost() {
+        // B13: auth/check is less sensitive but still shouldn't be free
+        let cost = operation_cost("GET", "/api/auth/check").get();
+        assert!(
+            cost >= 10,
+            "B13: auth/check cost should be >= 10, got {cost}"
+        );
+    }
 }

@@ -14,6 +14,12 @@ use tracing::info;
 /// Request ID header name (standard).
 pub const REQUEST_ID_HEADER: &str = "x-request-id";
 
+/// Redact sensitive query parameters from a URI before logging.
+/// TODO(B6): Implement redaction of ?token= and other secret params.
+pub fn redact_uri(uri: &str) -> String {
+    uri.to_string()
+}
+
 /// Middleware: inject a unique request ID and log the request/response.
 pub async fn request_logging(request: Request<Body>, next: Next) -> Response<Body> {
     let request_id = uuid::Uuid::new_v4().to_string();
@@ -94,6 +100,7 @@ pub async fn auth(
         || (path == "/.well-known/agent.json" && is_get)
         || path == "/api/health"
         || path == "/api/version"
+        || path.starts_with("/hooks/") // Webhook endpoints have their own token auth
         || path.starts_with("/api/providers/github-copilot/oauth/")
         || path == "/api/auth/login"
         || path == "/api/auth/logout"
@@ -241,5 +248,29 @@ mod tests {
     #[test]
     fn test_request_id_header_constant() {
         assert_eq!(REQUEST_ID_HEADER, "x-request-id");
+    }
+
+    #[test]
+    fn test_b6_redact_uri_strips_token_param() {
+        // B6: URIs logged by tracing must NOT contain secret query parameters.
+        // redact_uri() should strip sensitive params like ?token= from the URI
+        // before it reaches any log output.
+        assert_eq!(
+            redact_uri("/api/logs/stream?token=s3cret"),
+            "/api/logs/stream?token=[REDACTED]"
+        );
+    }
+
+    #[test]
+    fn test_b6_redact_uri_preserves_other_params() {
+        assert_eq!(
+            redact_uri("/api/agents?page=1&token=s3cret&limit=10"),
+            "/api/agents?page=1&token=[REDACTED]&limit=10"
+        );
+    }
+
+    #[test]
+    fn test_b6_redact_uri_no_query_unchanged() {
+        assert_eq!(redact_uri("/api/health"), "/api/health");
     }
 }

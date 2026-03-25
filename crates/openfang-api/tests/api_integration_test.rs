@@ -1060,6 +1060,98 @@ async fn start_test_server_with_full_auth(api_key: &str, password: &str) -> Test
     }
 }
 
+/// Start a test server with webhook triggers enabled.
+async fn start_test_server_with_webhook() -> TestServer {
+    use openfang_types::config::WebhookTriggerConfig;
+
+    // Set the env var that validate_webhook_token reads
+    std::env::set_var(
+        "TEST_WEBHOOK_TOKEN",
+        "test-webhook-token-that-is-at-least-32-chars-long!!",
+    );
+
+    let tmp = tempfile::tempdir().expect("Failed to create temp dir");
+    let api_key = "test-api-key".to_string();
+
+    let config = KernelConfig {
+        home_dir: tmp.path().to_path_buf(),
+        data_dir: tmp.path().join("data"),
+        api_key: api_key.clone(),
+        webhook_triggers: Some(WebhookTriggerConfig {
+            enabled: true,
+            token_env: "TEST_WEBHOOK_TOKEN".to_string(),
+            ..WebhookTriggerConfig::default()
+        }),
+        default_model: DefaultModelConfig {
+            provider: "ollama".to_string(),
+            model: "test-model".to_string(),
+            api_key_env: "OLLAMA_API_KEY".to_string(),
+            base_url: None,
+        },
+        ..KernelConfig::default()
+    };
+
+    let kernel = OpenFangKernel::boot_with_config(config).expect("Kernel should boot");
+    let kernel = Arc::new(kernel);
+    kernel.set_self_handle();
+
+    let state = Arc::new(AppState {
+        kernel,
+        started_at: Instant::now(),
+        peer_registry: None,
+        bridge_manager: tokio::sync::Mutex::new(None),
+        channels_config: tokio::sync::RwLock::new(Default::default()),
+        shutdown_notify: Arc::new(tokio::sync::Notify::new()),
+        clawhub_cache: dashmap::DashMap::new(),
+        provider_probe_cache: openfang_runtime::provider_health::ProbeCache::new(),
+    });
+
+    let auth_state = middleware::AuthState {
+        api_key: api_key.clone(),
+        auth_enabled: false,
+        session_secret: api_key.clone(),
+    };
+
+    let app = Router::new()
+        .route("/api/health", axum::routing::get(routes::health))
+        .route("/api/status", axum::routing::get(routes::status))
+        .route(
+            "/api/agents",
+            axum::routing::get(routes::list_agents).post(routes::spawn_agent),
+        )
+        .route(
+            "/api/agents/{id}/message",
+            axum::routing::post(routes::send_message),
+        )
+        .route("/hooks/agent", axum::routing::post(routes::webhook_agent))
+        .route("/api/shutdown", axum::routing::post(routes::shutdown))
+        .layer(axum::middleware::from_fn_with_state(
+            auth_state,
+            middleware::auth,
+        ))
+        .layer(axum::middleware::from_fn(middleware::request_logging))
+        .layer(TraceLayer::new_for_http())
+        .layer(CorsLayer::permissive())
+        .with_state(state.clone());
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("Failed to bind test server");
+    let addr = listener.local_addr().unwrap();
+
+    tokio::spawn(async move {
+        axum::serve(listener, app.into_make_service_with_connect_info::<std::net::SocketAddr>()).await.unwrap();
+    });
+
+    TestServer {
+        base_url: format!("http://{}", addr),
+        state,
+        session_secret: api_key.clone(),
+        api_key,
+        _tmp: tmp,
+    }
+}
+
 #[tokio::test]
 async fn test_auth_health_is_public() {
     let server = start_test_server_with_auth("secret-key-123").await;
@@ -1265,6 +1357,112 @@ async fn test_b3_all_transports_reject_without_auth() {
         "B3: WebSocket must reject without auth"
     );
 }
+
+// ---- B9: Sensitive endpoints must require auth ----
+
+#[tokio::test]
+async fn test_b9_agents_endpoint_requires_auth() {
+    // B9: /api/agents was previously in the public allowlist.
+    // It must require auth since it leaks deployment state.
+    let server = start_test_server_with_auth("secret-key-123").await;
+    let client = reqwest::Client::new(); // no auth
+
+    let resp = client
+        .get(format!("{}/api/agents", server.base_url))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        401,
+        "B9: /api/agents must require auth"
+    );
+}
+
+#[tokio::test]
+async fn test_b9_config_endpoint_requires_auth() {
+    let server = start_test_server_with_auth("secret-key-123").await;
+    let client = reqwest::Client::new();
+
+    let resp = client
+        .get(format!("{}/api/config", server.base_url))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        401,
+        "B9: /api/config must require auth"
+    );
+}
+
+#[tokio::test]
+async fn test_b9_budget_endpoint_requires_auth() {
+    let server = start_test_server_with_auth("secret-key-123").await;
+    let client = reqwest::Client::new();
+
+    let resp = client
+        .get(format!("{}/api/budget", server.base_url))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        401,
+        "B9: /api/budget must require auth"
+    );
+}
+
+#[tokio::test]
+async fn test_b9_status_endpoint_requires_auth() {
+    // /api/status was public — it exposes agent count, provider info, uptime
+    let server = start_test_server_with_auth("secret-key-123").await;
+    let client = reqwest::Client::new();
+
+    let resp = client
+        .get(format!("{}/api/status", server.base_url))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        401,
+        "B9: /api/status must require auth"
+    );
+}
+
+// ---- B12: Webhook must require explicit agent ----
+
+#[tokio::test]
+async fn test_b12_webhook_rejects_missing_agent() {
+    // B12: When a webhook payload doesn't specify an agent, the handler should
+    // reject with 400 instead of silently defaulting to the first agent.
+    let server = start_test_server_with_webhook().await;
+    let client = reqwest::Client::new();
+
+    // Send webhook with NO agent field — should be rejected
+    let resp = client
+        .post(format!("{}/hooks/agent", server.base_url))
+        .header("authorization", "Bearer test-webhook-token-that-is-at-least-32-chars-long!!")
+        .header("content-type", "application/json")
+        .body(r#"{"message": "test without specifying agent"}"#)
+        .send()
+        .await
+        .unwrap();
+
+    let status = resp.status();
+    let body: serde_json::Value = resp.json().await.unwrap();
+    // The handler should return 400 with a clear error about missing agent.
+    // Currently it defaults to first agent and returns 200 (success) or 500
+    // (execution failure) — neither is correct.
+    assert_eq!(
+        status, 400,
+        "B12: Webhook without explicit agent must return 400, not silently default \
+         to first agent. Got {status} with body: {body}"
+    );
+}
+
+// ---- B3 continued ----
 
 #[tokio::test]
 async fn test_b3_ws_duplicate_auth_rejects_session_cookie_when_api_key_set() {
